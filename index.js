@@ -78,19 +78,42 @@ const loadUUID = () => {
 const UUID = loadUUID();
 
 // ========== 5. sing-box 配置（只绑回环，外部流量统一走 Node 网关） ==========
-const finalConfig = {
-  log: { level: "info" },
-  inbounds: [{
+const certPath = path.join(__dirname, 'cert.pem');
+const keyPath = path.join(__dirname, 'key.pem');
+const HY2_PASS = UUID.replace(/-/g, '').slice(0, 16); // Hysteria2 密码（由 UUID 派生）
+
+// 配置在启动前写入：证书存在才启用 Hysteria2（UDP），避免缺证书导致核心起不来
+function writeConfig() {
+  const inbounds = [{
     type: "vless",
     tag: "vless-in",
     listen: "127.0.0.1",
     listen_port: INTERNAL_PORT,
     users: [{ uuid: UUID }],
-    transport: { type: "ws", path: "/vless-ws" }
-  }],
-  outbounds: [{ type: "direct", tag: "direct" }]
-};
-fs.writeFileSync(configPath, JSON.stringify(finalConfig, null, 2));
+    transport: {
+      type: "ws",
+      path: "/vless-ws",
+      max_early_data: 2048,
+      early_data_header_name: "Sec-WebSocket-Protocol"
+    }
+  }];
+  if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+    inbounds.push({
+      type: "hysteria2",
+      tag: "hy2-in",
+      listen: "0.0.0.0",
+      listen_port: PORT,
+      users: [{ password: HY2_PASS }],
+      tls: { enabled: true, certificate_path: certPath, key_path: keyPath }
+    });
+  }
+  const finalConfig = {
+    log: { level: "info" },
+    inbounds,
+    outbounds: [{ type: "direct", tag: "direct" }]
+  };
+  fs.writeFileSync(configPath, JSON.stringify(finalConfig, null, 2));
+}
 
 // ========== 6. 运行状态与节点链接生成 ==========
 const state = { tunnelDomain: null, bestCF: null, ptrDomain: null };
@@ -98,19 +121,24 @@ const state = { tunnelDomain: null, bestCF: null, ptrDomain: null };
 function buildLinks() {
   const links = [];
   const t = state.tunnelDomain;
+  const ed = '&ed=2048';
   if (t) {
     // 优选域名入口：客户端自行解析，就近接入 CF 边缘
-    links.push(`vless://${UUID}@${CF_OPT_DOMAIN}:443?encryption=none&security=tls&sni=${t}&type=ws&host=${t}&path=%2Fvless-ws#CF-Opt-Domain`);
+    links.push(`vless://${UUID}@${CF_OPT_DOMAIN}:443?encryption=none&security=tls&sni=${t}&type=ws&host=${t}&path=%2Fvless-ws${ed}#CF-Opt-Domain`);
     // 服务器实测最快入口 IP
     if (state.bestCF) {
-      links.push(`vless://${UUID}@${state.bestCF}:443?encryption=none&security=tls&sni=${t}&type=ws&host=${t}&path=%2Fvless-ws#CF-Tunnel-OptIP`);
+      links.push(`vless://${UUID}@${state.bestCF}:443?encryption=none&security=tls&sni=${t}&type=ws&host=${t}&path=%2Fvless-ws${ed}#CF-Tunnel-OptIP`);
     }
     // 默认解析入口（保底）
-    links.push(`vless://${UUID}@${t}:443?encryption=none&security=tls&sni=${t}&type=ws&host=${t}&path=%2Fvless-ws#CF-Tunnel`);
+    links.push(`vless://${UUID}@${t}:443?encryption=none&security=tls&sni=${t}&type=ws&host=${t}&path=%2Fvless-ws${ed}#CF-Tunnel`);
   }
-  links.push(`vless://${UUID}@${IP}:${PORT}?encryption=none&security=none&type=ws&host=${IP}&path=%2Fvless-ws#Native-IP-Direct`);
+  links.push(`vless://${UUID}@${IP}:${PORT}?encryption=none&security=none&type=ws&host=${IP}&path=%2Fvless-ws${ed}#Native-IP-Direct`);
   if (state.ptrDomain) {
-    links.push(`vless://${UUID}@${state.ptrDomain}:${PORT}?encryption=none&security=none&type=ws&host=${state.ptrDomain}&path=%2Fvless-ws#Native-Domain-Direct`);
+    links.push(`vless://${UUID}@${state.ptrDomain}:${PORT}?encryption=none&security=none&type=ws&host=${state.ptrDomain}&path=%2Fvless-ws${ed}#Native-Domain-Direct`);
+  }
+  // Hysteria2（UDP 直连，高丢包线路提速明显；平台不放行 UDP 时此节点不可用，忽略即可）
+  if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+    links.push(`hysteria2://${HY2_PASS}@${IP}:${PORT}?sni=www.bing.com&insecure=1#HY2-Direct`);
   }
   return links;
 }
@@ -149,11 +177,17 @@ function printAndPush() {
   lines.push(...tlsLinks);
   lines.push('');
   lines.push('⚡【原生 IP 直连节点链接】:');
-  lines.push(`vless://${UUID}@${IP}:${PORT}?encryption=none&security=none&type=ws&host=${IP}&path=%2Fvless-ws#Native-IP-Direct`);
+  lines.push(`vless://${UUID}@${IP}:${PORT}?encryption=none&security=none&type=ws&host=${IP}&path=%2Fvless-ws&ed=2048#Native-IP-Direct`);
   if (state.ptrDomain) {
     lines.push('');
     lines.push('🌐【原生域名直连节点链接】:');
-    lines.push(`vless://${UUID}@${state.ptrDomain}:${PORT}?encryption=none&security=none&type=ws&host=${state.ptrDomain}&path=%2Fvless-ws#Native-Domain-Direct`);
+    lines.push(`vless://${UUID}@${state.ptrDomain}:${PORT}?encryption=none&security=none&type=ws&host=${state.ptrDomain}&path=%2Fvless-ws&ed=2048#Native-Domain-Direct`);
+  }
+  const hy2 = buildLinks().filter(l => l.startsWith('hysteria2://'));
+  if (hy2.length) {
+    lines.push('');
+    lines.push('⚡【Hysteria2 UDP 节点】(高丢包线路提速，需平台放行 UDP，连不上即平台封 UDP):');
+    lines.push(...hy2);
   }
   lines.push('==================================================');
   const text = lines.join('\n');
@@ -238,6 +272,9 @@ function prepareAndStart() {
   }
   if (!fs.existsSync(BIN_TUNNEL)) {
     steps.push(`curl -A "${ua}" -sSL -o ${BIN_TUNNEL} "${URL_TUNNEL}" && chmod +x ${BIN_TUNNEL}`);
+  }
+  if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+    steps.push(`openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes -keyout ${keyPath} -out ${certPath} -subj "/CN=www.bing.com"`);
   }
   const runSteps = (i) => {
     if (i >= steps.length) { startServices(); return; }
@@ -325,6 +362,7 @@ async function runTunnel() {
 }
 
 function startServices() {
+  writeConfig();
   if (fs.existsSync(BIN_CORE)) runCore();
   if (fs.existsSync(BIN_TUNNEL)) runTunnel();
 }
